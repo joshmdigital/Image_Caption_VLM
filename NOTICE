@@ -1,0 +1,37 @@
+Image Captioning with CNN + LSTM (MobileNetV2 Encoder, LSTM Decoder)
+Copyright 2025 Joshua Moffat
+
+This product includes software developed by The TensorFlow Authors
+(https://github.com/tensorflow/models), licensed under the Apache License,
+Version 2.0.
+
+The MobileNetV2 architecture and ImageNet-pretrained weights used as the
+visual encoder in this project originate from the TensorFlow models
+repository:
+
+    Copyright The TensorFlow Authors. All Rights Reserved.
+    Licensed under the Apache License, Version 2.0.
+    https://github.com/tensorflow/models/tree/master/research/slim/nets/mobilenet
+
+The MobileNetV2 weights distributed within the trained model checkpoint
+(.h5 file) in this repository have been fine-tuned from the original
+ImageNet-pretrained weights. Modifications include: unfreezing and
+retraining the final 10 convolutional layers on the Flickr8k caption
+dataset as part of an end-to-end image-captioning model.
+
+This product was trained on the Flickr8k dataset:
+
+    Hodosh, M., Young, P., & Hockenmaier, J. (2013). Framing image
+    description as a ranking task: Data, models and evaluation metrics.
+    Journal of Artificial Intelligence Research, 47, 853-899.
+
+The Flickr8k dataset is provided by its authors for non-commercial
+research and educational use only. The individual photographs remain
+under the copyright of their original Flickr authors. No Flickr8k
+images are redistributed in this repository.
+
+Evaluation uses the SPICE metric from the pycocoevalcap package:
+
+    Anderson, P., Fernando, B., Johnson, M., & Gould, S. (2016).
+    SPICE: Semantic Propositional Image Caption Evaluation.
+    arXiv:1607.08822.
