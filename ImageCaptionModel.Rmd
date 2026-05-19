@@ -1,0 +1,2083 @@
+---
+title: "DAR3"
+author: "Joshua Moffat"
+date: "2025-04-16"
+output: pdf_document
+---
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r, setup}
+#After initial python environment is set-up, load reticulate library, assign python path, load remaining libraries
+#Python path must be assigned right after loading reticulate, otherwise a temporary python environment will be created automatically
+
+#Step 1
+library(reticulate)
+
+#Step 3
+library(tidyverse); library(here)
+
+# ----  Python environment only run once---------------------------------------------
+# env <- "caption-env"
+# if (!env %in% conda_list()$name) {
+#   conda_create(env, packages = c("python=3.10"))
+#   conda_install(env, c(
+#     "tensorflow==2.11.0","numpy","pillow","tqdm",
+#     "scikit-learn","matplotlib","nltk","pycocoevalcap","spacy"))
+# }
+#use_condaenv(env, required = TRUE)
+
+#Step 2
+python_path <- "/Users/joshuamoffat/Library/r-miniconda/envs/caption-env/bin/python"
+use_python(python_path, required = TRUE)
+
+#Run only once to make sure pandas and the correct version of tensorflow is installed
+# try({
+#   py_install(c("pandas", "tensorflow==2.11.0"), pip = TRUE)
+# }, silent = TRUE)
+```
+
+```{python, check}
+#Check important python packages have been installed
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+print("✅ TensorFlow and Keras are ready!")
+```
+
+
+```{python, helpers}
+#Import all python packages
+import os, re, itertools, collections, json, math, random, pickle, warnings
+from pathlib import Path
+import numpy as np, pandas as pd
+from PIL import Image
+import tensorflow as tf, matplotlib.pyplot as plt
+from tensorflow import keras; from tensorflow.keras import layers
+from tqdm import tqdm
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------- #
+#              Caption tokeniser (≥5 occurrences kept)                   #
+# ---------------------------------------------------------------------- #
+class CaptionTokenizer:
+    def __init__(self, threshold=5):
+        self.threshold = threshold
+        self.word2idx = {"<pad>":0,"<start>":1,"<end>":2,"<unk>":3}
+        self.idx2word = {v:k for k,v in self.word2idx.items()}
+
+    def fit(self, captions):
+        cnt = collections.Counter(itertools.chain(*captions))
+        for w,f in cnt.items():
+            if f>=self.threshold and w not in self.word2idx:
+                i=len(self.word2idx)
+                self.word2idx[w]=i; self.idx2word[i]=w
+
+    def encode(self,toks):   return [self.word2idx.get(w,3) for w in toks]
+    def decode(self,ids):    return [self.idx2word.get(i,"<unk>") for i in ids]
+    def __len__(self):       return len(self.word2idx)
+```
+
+```{r, paths}
+#Assign variables to the various file paths that we will access locally 
+root <- here("flickr8k")        # <-- folder that holds images/ + captions.txt
+img_dir <- file.path(root, "images")
+capt_file <- file.path(root, "captions.txt")
+stopifnot(file.exists(capt_file))
+
+seed <- 42; set.seed(seed); reticulate::py_set_seed(seed)
+output_dir <- here()                 # same folder as this Rmd file
+```
+
+```{python, clean}
+#-------------------------------------------------------------
+def clean(txt):
+    txt = re.sub(r"[^\w\s]", "", txt.lower()).strip()
+    return ["<start>"] + txt.split() + ["<end>"]
+
+caps_raw = pd.read_csv(r.capt_file, sep=",", header=0)
+caps_raw["tokens"] = caps_raw.caption.apply(clean)
+
+# --------------  train / val / test split by image id --------------
+files = caps_raw["image"].unique()
+rng = np.random.default_rng(int(r.seed))
+rng.shuffle(files)
+n=len(files); train_ids, val_ids = files[:int(.7*n)], files[int(.7*n):int(.85*n)]
+split = np.where(caps_raw.image.isin(train_ids),"train",
+        np.where(caps_raw.image.isin(val_ids),"val","test"))
+caps_raw["split"]=split
+
+tok = CaptionTokenizer(threshold=5)
+tok.fit(caps_raw.query("split=='train'")["tokens"])
+vocab_size=len(tok)
+
+PAD_TOKEN_ID = tok.word2idx["<pad>"]
+END_TOKEN_ID = tok.word2idx["<end>"]
+id2word      = tok.idx2word
+
+# 95‑th percentile caption length
+cap_len = caps_raw.tokens.map(len)
+max_len = int(np.percentile(cap_len,95))
+def encode_pad(toks, max_len=max_len):
+    ids = tok.encode(toks)[:max_len]
+    return ids + [0]*(max_len-len(ids))
+
+caps_raw["enc"] = caps_raw.tokens.apply(encode_pad)
+
+```
+
+```{python, image}
+#Smaller images size for faster runtime; downside is less information to train the CNN
+
+IMG_SZ=224  #224 or 160
+
+def load_img(path):
+    img = Image.open(path).convert("RGB").resize((IMG_SZ,IMG_SZ))
+    return np.asarray(img,dtype="float32")/255.0
+  
+ #Switch to batch 34 for to use less resources  
+def make_ds(df, batch=64, shuffle=True):
+    # Turn the dataframe into a tf.data.Dataset
+    file_paths = [os.path.join(r.img_dir, fname) for fname in df["image"]]
+    sequences  = list(df["enc"])
+    labels     = [enc[1:] for enc in sequences]
+    inputs     = [enc[:-1] for enc in sequences]
+
+    ds = tf.data.Dataset.from_tensor_slices((file_paths, inputs, labels))
+
+    # Shuffle before mapping for performance
+    if shuffle:
+        ds = ds.shuffle(buffer_size=len(df), seed=int(r.seed))
+
+    def load_pair(path, seq_in, seq_out):
+        img = tf.io.read_file(path)
+        img = tf.image.decode_jpeg(img, channels=3)
+        img = tf.image.resize(img, [IMG_SZ, IMG_SZ]) / 255.0
+        return (img, seq_in), seq_out
+
+    ds = ds.map(load_pair, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.batch(batch).prefetch(tf.data.AUTOTUNE)
+    return ds
+
+  
+  
+```
+
+```{python, imagedata}
+#All 8k images used
+train_ds = make_ds(caps_raw.query("split=='train'"))
+val_ds   = make_ds(caps_raw.query("split=='val'"), shuffle=False)
+
+#Subset data for debugging and more interactive/faster runs 
+SUBSET = 3000 # number of caption rows to keep during grid search
+VAL_SUBSET = 400 
+train_subset = caps_raw.query("split=='train'").sample(SUBSET, random_state=int(r.seed))
+val_subset   = caps_raw.query("split=='val'").sample(VAL_SUBSET, random_state=int(r.seed))   
+
+train_ds = make_ds(train_subset, batch=64)      # faster batches
+val_ds   = make_ds(val_subset,   batch=64)
+
+#Check that the data set of batches has successfully populated
+#Each batch is a combination images, caption_in and caption_out sequences of size X
+for batch in train_ds.take(1):
+    print("successfully loaded a training batch")
+
+```
+
+
+```{python, model}
+
+class ReMask(layers.Layer):
+    """Re‑attach the padding mask from the input seq_in onto the logits."""
+    def call(self, inputs):
+        logits, seq_in = inputs
+        return logits
+
+    def compute_mask(self, inputs, mask=None):
+        # inputs = [logits, seq_in]; we ignore mask here
+        seq_in = inputs[1]  # shape (batch, T)
+        return tf.not_equal(seq_in, 0)  # True for real tokens, False for padding
+
+def build_model(vocab_size, max_len,
+                embed_dim   = 256,
+                lstm_units  = 256,
+                lr          = 1e-3,
+                train_cnn   = False,
+                unfreeze_at = -20):
+
+    IMG_SZ = 224
+    # ---------- CNN encoder ----------
+    base = keras.applications.MobileNetV2(include_top=False,
+                                          weights="imagenet",
+                                          pooling="avg",
+                                          input_shape=(IMG_SZ, IMG_SZ, 3))
+    base.trainable = train_cnn
+    if train_cnn and unfreeze_at < 0:          # optional fine‑tuning later
+        for layer in base.layers[:unfreeze_at]:
+            layer.trainable = False
+
+    # ---------- inputs ----------
+    IMG_SZ = 224 #224 or 160
+    img_in = layers.Input((IMG_SZ, IMG_SZ, 3), name="image")
+    seq_in = layers.Input((max_len - 1,), name="caption_in")  # minus 1 for image step
+
+    # ---------- visual embedding ----------
+    img_vec = layers.Dense(embed_dim, activation="relu")(base(img_in))   # (batch,E)
+
+    # ---------- word embeddings WITH masking ----------
+    tok_emb = layers.Embedding(vocab_size,
+                               embed_dim,
+                               mask_zero=True,
+                               name='tok_emb')(seq_in)        # (batch, T, E)
+
+    # ---------- add image token & merge masks ----------
+    class AddImageToken(layers.Layer):
+        def call(self, inputs):
+            img, tok = inputs                 # img (batch,E)  tok (batch,T,E)
+            img = tf.expand_dims(img, 1)      # (batch,1,E)
+            return tf.concat([img, tok], axis=1)  # (batch,1+T,E)
+
+        def compute_mask(self, inputs, mask=None):
+            # mask[1] is token mask (batch,T); create (batch,1) True mask for image
+            img_mask = tf.ones((tf.shape(inputs[0])[0], 1), dtype=tf.bool)
+            return tf.concat([img_mask, mask[1]], axis=1)     # (batch,1+T)
+
+    x = AddImageToken(name="add_img")([img_vec, tok_emb])                   # (batch,1+T,E)
+
+    # ---------- LSTM decoder ----------
+    x   = layers.LSTM(lstm_units, return_sequences=True)(x)
+    
+    # 1) drop the image‑token timestep
+    x = layers.Cropping1D(cropping=(1, 0), name="slice_img")(x)
+    
+    # project to vocab
+    logits = layers.TimeDistributed(layers.Dense(vocab_size), name="time_dist")(x)
+    masked_logits = ReMask(name="re_mask")([logits, seq_in])
+    
+    # softmax + compile
+    out = layers.Activation("softmax", name="softmax")(masked_logits)
+
+    model = keras.Model([img_in, seq_in], out)
+    model.compile(optimizer = keras.optimizers.Adam(lr),
+                  loss      = "sparse_categorical_crossentropy")
+    return model
+
+
+```
+
+```{python, modelattention}
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+class ReMask(layers.Layer):
+    """Re-attach the padding mask from seq_in onto the logits."""
+    def call(self, inputs):
+        logits, seq_in = inputs
+        return logits
+    def compute_mask(self, inputs, mask=None):
+        seq_in = inputs[1]                       # (batch, T)
+        return tf.not_equal(seq_in, 0)           # True for real tokens
+
+def build_model(vocab_size, max_len,
+                embed_dim   = 256,
+                lstm_units  = 256,
+                lr          = 1e-3,
+                train_cnn   = False,
+                unfreeze_at = -20):
+
+    IMG_SZ = 224
+    # -------- CNN encoder (no global pooling!) ---------------------
+    base = keras.applications.MobileNetV2(include_top=False,
+                                          weights="imagenet",
+                                          pooling=None,             # keep spatial map
+                                          input_shape=(IMG_SZ, IMG_SZ, 3))
+    base.trainable = train_cnn
+    if train_cnn and unfreeze_at < 0:
+        for layer in base.layers[:unfreeze_at]:
+            layer.trainable = False
+
+    # -------- inputs ----------------------------------------------
+    img_in = layers.Input((IMG_SZ, IMG_SZ, 3),  name="image")
+    seq_in = layers.Input((max_len - 1,),        name="caption_in")  # T = max_len-1
+
+    # -------- visual feature sequence  (S = 7*7 = 49) -------------
+    feat_map  = base(img_in)                                         # (B,7,7,1280)
+    feat_proj = layers.Conv2D(embed_dim, 1, activation="relu")(feat_map)
+    feat_seq  = layers.Reshape((-1, embed_dim))(feat_proj)   # (B,S,E)
+    
+    
+    # NEW: match depth to lstm_units so Attention sees (B,*,512)
+    feat_seq  = layers.Dense(lstm_units, use_bias=False,
+                         name="feat_to_hidden")(feat_seq)   # (B,49,U)
+
+    # also build 1 global vector to init the LSTM
+    img_vec   = layers.GlobalAveragePooling2D()(feat_map)            # (B,1280)
+    init_h    = layers.Dense(lstm_units, activation="tanh")(img_vec) # (B,U)
+    init_c    = layers.Dense(lstm_units, activation="tanh")(img_vec)
+
+    # -------- word embeddings (masking on) ------------------------
+    tok_emb = layers.Embedding(vocab_size,
+                               embed_dim,
+                               mask_zero=True,
+                               name="tok_emb")(seq_in)               # (B,T,E)
+
+    # -------- LSTM decoder ---------------------------------------
+    dec_out = layers.LSTM(lstm_units,
+                          return_sequences=True,
+                          name="decoder")(tok_emb,
+                                          initial_state=[init_h, init_c])    # (B,T,U)
+
+    # -------- Luong / dot-product attention ----------------------
+    #   Q = decoder timesteps  (B,T,U)
+    #   K,V = visual regions   (B,S,E)      Attention does Q·K^T / sqrt(d_k)
+    #ctx = layers.Attention(name="attn")([dec_out, feat_seq])         # (B,T,U)
+    
+    attn_layer = layers.Attention(name="attn")          # constructor clean
+    ctx, attn_scores = attn_layer(                      # ask during call
+        [dec_out, feat_seq],
+        return_attention_scores=True)               # tuple  (B,T,U), (B,T,S)
+
+    # concat context + decoder state, then project to vocab
+    merged  = layers.Concatenate()([dec_out, ctx])                   # (B,T,2U)
+    logits  = layers.TimeDistributed(layers.Dense(vocab_size),
+                                     name="td_dense")(merged)
+    masked  = ReMask(name="re_mask")([logits, seq_in])
+    out     = layers.Activation("softmax", name="softmax")(masked)
+
+    model = keras.Model([img_in, seq_in], out)
+    model.compile(optimizer = keras.optimizers.Adam(lr),
+                  loss      = "sparse_categorical_crossentropy")
+        
+    return model
+
+
+```
+
+```{python, callback SPICE}
+        
+from pycocoevalcap.spice.spice import Spice
+
+class SpiceCallback(keras.callbacks.Callback):
+    def __init__(self, ds, every=1, k=3):
+        super().__init__()
+        self.ds = ds
+        self.every = every
+        self.best = -1
+        self.k = k
+
+    def on_epoch_end(self, epoch, logs=None):
+        if epoch % self.every != 0:
+            return
+
+        refs, hyps = {}, {}
+        idx = 0
+
+        for (imgs, seqs), labels in self.ds:
+            expected_len = self.model.input[1].shape[1]  # e.g., 19
+            seqs_fixed = tf.pad(seqs[:, :1], [[0, 0], [0, expected_len - 1]])
+            preds = self.model.predict((imgs, seqs_fixed), verbose=0)
+            pred_ids = np.argmax(preds[:, 0, :], axis=-1)
+
+            for p, lab in zip(pred_ids, labels):
+                # Decode label into list of tokens, remove <start>/<end>, then join
+                decoded_ref_tokens = tok.decode(lab.numpy())[1:-1]
+                ref_str = " ".join(decoded_ref_tokens)
+
+                # Decode predicted token ID into word string
+                pred_token = tok.idx2word.get(int(p), "<unk>")  # ensure p is an int
+                hyp_str = pred_token
+
+                refs[idx] = [ref_str]
+                hyps[idx] = [hyp_str]
+                idx += 1
+
+        spice, _ = Spice().compute_score(refs, hyps)
+        logs["val_spice"] = spice
+
+        if spice > self.best:
+            self.best = spice
+            self.model.save(os.path.join(r.output_dir, "best_captioner.h5"))
+
+        print(f"\nEpoch {epoch}: val_SPICE={spice:.3f}  (best={self.best:.3f})")
+
+```
+
+```{python, callbackSPICE2}
+from pycocoevalcap.spice.spice import Spice
+import numpy as np, tensorflow as tf, os, tqdm, keras
+
+class SpiceCallback(keras.callbacks.Callback):
+    def __init__(self, ds, tok, max_len, every=1, k=1, out_dir="ckpts"):
+        super().__init__()
+        self.ds      = ds
+        self.tok     = tok
+        self.max_len = max_len
+        self.every   = every
+        self.k       = k
+        self.best    = -1
+        self.out_dir = out_dir
+        self.scorer  = Spice()          # keep JVM warm
+
+    # ------------------------------------------------------------------
+    # greedy decoder (k == 1)
+    # ------------------------------------------------------------------
+    def _greedy(self, img_tensor):
+      seq = [self.tok.start_id]
+      for _ in range(self.max_len - 1):
+          pad_len  = self.max_len - len(seq)
+          seq_in   = np.pad(seq, (0, pad_len))[: self.max_len - 1].astype("int32")
+
+          img_b = img_tensor[None, ...]            # (1,H,W,3)
+          seq_b = seq_in[None, ...]                # (1,T)
+          logits = self.model.predict([img_b, seq_b], verbose=0)
+
+          next_id = int(np.argmax(logits[0, len(seq)-1, :]))
+          if next_id == self.tok.end_id:
+              break
+          seq.append(next_id)
+
+    # 🔑  return plain string, not list
+      return " ".join(self.tok.decode(seq[1:]))     # drop <start>
+
+
+    # ------------------------------------------------------------------
+    def on_epoch_end(self, epoch, logs=None):
+        if epoch % self.every:
+            return
+
+        refs, hyps, idx = {}, {}, 0
+
+        for (imgs, _), labels in tqdm.tqdm(self.ds, desc="SPICE   "):
+            for img, lab in zip(imgs, labels):
+                # -------- reference --------
+                ref = " ".join(self.tok.decode(lab.numpy())[1:-1])
+                refs[idx] = [ref]                     # list of refs
+
+                # -------- hypothesis --------
+                if self.k == 1:
+                    hyp = self._greedy(img.numpy())
+                else:
+                    ids = beam_search_decode(self.model, img.numpy(),
+                                             self.tok, self.max_len, k=self.k)
+                    hyp = " ".join(self.tok.decode(ids[1:]))
+                hyps[idx] = [hyp]                     # list **length 1**  ← FIX
+                idx += 1
+
+        spice, _ = self.scorer.compute_score(refs, hyps)
+        logs["val_spice"] = spice
+
+        if spice > self.best:
+            self.best = spice
+            self.model.save_weights(os.path.join(self.out_dir,
+                                                 "best_captioner.h5"))
+
+        print(f"\nEpoch {epoch}: val_SPICE = {spice:.4f}   (best = {self.best:.4f})")
+
+
+
+```
+
+
+```{python, beam4}
+import os
+import random
+import json
+import tempfile
+import subprocess
+
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.callbacks import Callback
+from pycocoevalcap.spice.spice import Spice  # still imported, but unused
+import pycocoevalcap.spice.spice as spice_module  # to find jar & cache
+
+def beam_search_decode(model, img_tensor, tokenizer, max_len, k=3, alpha=0.7):
+    beam = [([tokenizer.start_id], 0.0)]
+    img_batch = img_tensor[None, ...]  # (1, H, W, 3)
+
+    for _ in range(max_len - 1):
+        new_beam = []
+        for seq, log_p in beam:
+            if seq[-1] == tokenizer.end_id:
+                new_beam.append((seq, log_p))
+                continue
+
+            pad_len   = (max_len - 1) - len(seq)
+            seq_pad   = seq + [tokenizer.pad_id] * pad_len
+            seq_in    = tf.constant([seq_pad], dtype=tf.int32)    # (1, L)
+            preds     = model([img_batch, seq_in], training=False)  # (1, L, V)
+
+            idx_last  = len(seq) - 1
+            logits    = preds[0, idx_last]
+            log_probs = tf.math.log_softmax(logits)
+
+            topk = tf.math.top_k(log_probs, k=k)
+            for idx, lp_step in zip(topk.indices.numpy(), topk.values.numpy()):
+                new_beam.append((seq + [int(idx)], log_p + float(lp_step)))
+
+        new_beam.sort(key=lambda t: t[1], reverse=True)
+        beam = new_beam[:k]
+        if all(s[-1] == tokenizer.end_id for s, _ in beam):
+            break
+
+    best_seq = max(beam, key=lambda t: t[1] / (len(t[0]) ** alpha))[0]
+    if best_seq and best_seq[0] == tokenizer.start_id:
+        best_seq = best_seq[1:]
+    if best_seq and best_seq[-1] == tokenizer.end_id:
+        best_seq = best_seq[:-1]
+    return tokenizer.decode(best_seq)
+
+
+class SpiceCallback(Callback):
+    def __init__(self, ds, tokenizer, max_len, output_dir,
+                 every=1, k=3, eval_subset=None):
+        super().__init__()
+        self.ds           = ds
+        self.tok          = tokenizer
+        self.max_len      = max_len
+        self.output_dir   = output_dir
+        self.every        = every
+        self.k            = k
+        self.eval_subset  = eval_subset   # number of images to sample each epoch
+        self.best         = -1.0
+
+    def on_epoch_end(self, epoch, logs=None):
+        if epoch % self.every != 0:
+            print(f"[SPICE] skipping epoch {epoch}")
+            return
+
+        print(f"[SPICE] starting SPICE eval at epoch {epoch}")
+
+        # 1) collect all (img, lab) pairs
+        all_pairs = []
+        for (img_batch, _), label_batch in self.ds:
+            for img, lab in zip(img_batch, label_batch):
+                all_pairs.append((img, lab))
+
+        # 2) shuffle & take subset if requested
+        if self.eval_subset is not None and len(all_pairs) > self.eval_subset:
+            random.shuffle(all_pairs)
+            pairs = all_pairs[:self.eval_subset]
+        else:
+            pairs = all_pairs
+
+        # 3) decode into refs & hyps (plain strings)
+        refs, hyps = {}, {}
+        for idx, (img, lab) in enumerate(pairs):
+            hyp = beam_search_decode(self.model, img, self.tok, self.max_len, k=self.k)
+            ref_tokens = self.tok.decode(lab.numpy())[1:-1]
+            refs[idx] = [" ".join(ref_tokens)]
+            hyps[idx] = hyp
+
+            if (idx + 1) % 10 == 0:
+                print(f"[SPICE]  – processed {idx+1} images")
+
+        print(f"[SPICE] total images processed: {len(pairs)}, computing SPICE…")
+
+        # 4) build JSON payload with test as plain string
+        payload = []
+        for img_id, ref_list in refs.items():
+            raw_hyp = hyps[img_id]
+            test_str = raw_hyp[0] if isinstance(raw_hyp, (list, tuple)) else raw_hyp
+            payload.append({
+                "image_id": img_id,
+                "refs":     ref_list,
+                "test":     test_str
+            })
+
+        # 5) dump to temp file and call the JAR
+        # inp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        #inp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".json")
+        #json.dump(payload, inp)
+        #inp.close()
+        #outp = inp.name + ".out"
+       
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".json") as inp:
+            json.dump(payload, inp)
+            inp_path = inp.name
+        outp = inp_path + ".out"
+
+        base_dir = os.path.dirname(spice_module.__file__)
+        jar_path = os.path.join(base_dir, "spice-1.0.jar")
+        cache    = os.path.join(base_dir, "cache")
+
+        cmd = [
+            "java", "-jar", jar_path,
+            inp.name,
+            "-cache", cache,
+            "-out", outp,
+            "-silent"
+        ]
+      
+        subprocess.check_call(cmd)
+
+        # 6) read back and extract the score
+        with open(outp, "r") as f:
+            result = json.load(f)
+            
+        # if the JAR returned a list, take its first element:
+        if isinstance(result, list):
+          result = result[0]
+        
+        #print("[SPICE] raw JAR output:", json.dumps(result, indent=2))  
+        #spice_score = result["scores"]["All"]["score"]
+        
+        scores_dict = result.get("scores", {})
+        all_section = scores_dict.get("All", {})
+
+        # Pull out the SPICE F-score
+        spice_score = all_section.get("f")
+        if spice_score is None:
+          raise KeyError(f"Couldn't find 'f' in SPICE output: {scores_dict}")
+
+        # 7) log & checkpoint
+        logs = logs or {}
+        logs["val_spice"] = spice_score
+
+        if spice_score > self.best:
+            print(f"[SPICE] 🎉 new best ({spice_score:.4f}), saving model")
+            self.best = spice_score
+            os.makedirs(self.output_dir, exist_ok=True)
+            self.model.save(os.path.join(self.output_dir, "best_captioner.h5"))
+        else:
+            print(f"[SPICE] best remains {self.best:.4f}")
+
+        print(f"\nEpoch {epoch}: val_SPICE = {spice_score:.4f} (best = {self.best:.4f})")
+
+```
+
+
+```{python, computeSPICE}
+from pycocoevalcap.spice.spice import Spice
+
+def compute_spice(model, ds, tok, k=3):
+    refs, hyps = {}, {}
+    idx = 0
+
+    for (imgs, seqs), labels in ds:
+        expected_len = model.input[1].shape[1]
+        seqs_fixed = tf.pad(seqs[:, :1], [[0, 0], [0, expected_len - 1]])
+        preds = model.predict((imgs, seqs_fixed), verbose=0)
+        pred_ids = np.argmax(preds[:, 0, :], axis=-1)
+
+        for p, lab in zip(pred_ids, labels):
+            decoded_ref_tokens = tok.decode(lab.numpy())[1:-1]
+            ref_str = " ".join(decoded_ref_tokens)
+
+            pred_token = tok.idx2word.get(int(p), "<unk>")
+            hyp_str = pred_token
+
+            refs[idx] = [ref_str]
+            hyps[idx] = [hyp_str]
+            idx += 1
+
+    spice, _ = Spice().compute_score(refs, hyps)
+    return spice
+
+```
+
+```{python, computeSPICE2}
+
+from pycocoevalcap.spice.spice import Spice
+import numpy as np, tensorflow as tf
+
+# ------------------------------------------------------------------
+# simple greedy decoder  (fixed) -----------------------------------
+# ------------------------------------------------------------------
+def greedy_decode(model, img, tok, max_len):
+    """Return a plain-string caption generated with greedy decoding."""
+    seq = [tok.start_id]
+    for _ in range(max_len - 1):
+        pad     = max_len - len(seq)
+        seq_in  = np.pad(seq, (0, pad))[: max_len - 1].astype("int32")  # (T,)
+
+        img_b = img[None, ...]            # (1,H,W,3)
+        seq_b = seq_in[None, ...]         # (1,T)
+        logits = model.predict([img_b, seq_b], verbose=0)
+
+        next_id = int(np.argmax(logits[0, len(seq)-1, :]))
+        if next_id == tok.end_id:
+            break
+        seq.append(next_id)
+
+    # ---- return single caption string (not list) ------------------
+    return " ".join(tok.decode(seq[1:]))     # drop <start>
+
+# ------------------------------------------------------------------
+def compute_spice(model, ds, tok, max_len, k=1):
+    """
+    Compute SPICE over dataset `ds`.
+    If k==1 use greedy; if k>1 call beam_search_decode().
+    """
+    refs, hyps, idx = {}, {}, 0
+    scorer = Spice()                         # reuse JVM
+
+    for (imgs, _), labels in ds:
+        for img, lab in zip(imgs, labels):
+            print(f"Processing example {idx}...")
+            # -------- reference --------
+            ref = " ".join(tok.decode(lab.numpy())[1:-1])   # strip <start>/<end>
+            refs[idx] = [ref]                               # list of refs
+
+            # -------- hypothesis -------
+            if k == 1:
+                hyp = greedy_decode(model, img.numpy(), tok, max_len)
+            else:
+                ids = beam_search_decode(model, img.numpy(),
+                                          tok, max_len, k=k)
+                hyp = " ".join(tok.decode(ids[1:]))
+            hyps[idx] = [hyp]                               # list length 1
+
+            idx += 1
+
+    spice, _ = scorer.compute_score(refs, hyps)
+    return spice
+
+
+```
+
+
+
+```{python, computespicebeam2}
+
+import os
+import json
+import tempfile
+import subprocess
+
+import numpy as np
+import tensorflow as tf
+
+# to locate the JAR and cache directory
+import pycocoevalcap.spice.spice as spice_module
+
+def generate_caption_beam(model, image, tokenizer, max_len=20, beam_width=3, alpha=0.7):
+    beam = [([tokenizer.start_id], 0.0)]
+    img_batch = image[None, ...]
+    for _ in range(max_len - 1):
+        candidates = []
+        for seq, score in beam:
+            if seq[-1] == tokenizer.end_id:
+                candidates.append((seq, score))
+                continue
+            pad_len = (max_len - 1) - len(seq)
+            seq_pad = seq + [tokenizer.pad_id] * pad_len
+            seq_in  = tf.constant([seq_pad], dtype=tf.int32)
+            preds   = model([img_batch, seq_in], training=False)
+            logits  = preds[0, len(seq)-1]
+            logp    = tf.nn.log_softmax(logits).numpy()
+            topk    = np.argsort(logp)[-beam_width:]
+            for idx in topk:
+                candidates.append((seq + [int(idx)], score + float(logp[idx])))
+        candidates.sort(key=lambda t: t[1], reverse=True)
+        beam = candidates[:beam_width]
+        if all(s[-1] == tokenizer.end_id for s,_ in beam):
+            break
+
+    best_seq = max(beam, key=lambda t: t[1]/(len(t[0])**alpha))[0]
+    if best_seq and best_seq[0] == tokenizer.start_id:
+        best_seq = best_seq[1:]
+    if best_seq and best_seq[-1] == tokenizer.end_id:
+        best_seq = best_seq[:-1]
+    return tokenizer.decode(best_seq)
+
+def compute_spice(model, ds, tokenizer, max_len=20, beam_width=3, eval_subset=None):
+    # 1) collect (img, lab) pairs
+    all_pairs = []
+    for (imgs, _), labs in ds:
+        for img, lab in zip(imgs, labs):
+            all_pairs.append((img, lab))
+
+    # 2) optionally sample a subset
+    if eval_subset and len(all_pairs) > eval_subset:
+        np.random.shuffle(all_pairs)
+        all_pairs = all_pairs[:eval_subset]
+
+    # 3) decode all captions
+    refs, hyps = {}, {}
+    for idx, (img, lab) in enumerate(all_pairs):
+        hyp = generate_caption_beam(model, img, tokenizer,
+                                   max_len=max_len, beam_width=beam_width)
+        ref_tokens = tokenizer.decode(lab.numpy())[1:-1]
+        refs[idx] = [" ".join(ref_tokens)]
+        hyps[idx] = hyp
+
+    # 4) build JSON payload with test as string
+    payload = []
+    for img_id, ref_list in refs.items():
+        raw_hyp = hyps[img_id]
+        test_str = raw_hyp[0] if isinstance(raw_hyp, (list, tuple)) else raw_hyp
+        payload.append({
+            "image_id": img_id,
+            "refs":     ref_list,
+            "test":     test_str
+        })
+
+    # 5) write to temp file & call SPICE JAR
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as inp:
+        json.dump(payload, inp)
+        inp_path = inp.name
+    out_path = inp_path + '.out'
+
+    base_dir = os.path.dirname(spice_module.__file__)
+    jar_path = os.path.join(base_dir, 'spice-1.0.jar')
+    cache    = os.path.join(base_dir, 'cache')
+    cmd = [
+        'java', '-jar', jar_path,
+        inp_path,
+        '-cache', cache,
+        '-out',   out_path,
+        '-silent'
+    ]
+    subprocess.check_call(cmd)
+
+    # 6) read back & extract the F-score
+    with open(out_path, 'r') as f:
+        result = json.load(f)
+    if isinstance(result, list) and result:
+        result = result[0]
+    all_scores = result.get('scores', {}).get('All', {})
+    if 'f' not in all_scores:
+        raise KeyError(f"No 'f' in SPICE output: {all_scores}")
+    return all_scores['f']
+
+
+```
+
+```{python, mask_probe}
+import sys
+
+grid = [
+    dict(embed_dim=128, lstm_units=256, lr=1e-3)
+]
+
+histories = []
+MAX_EPOCHS = 2
+
+for i, cfg in enumerate(grid, 1):
+    print(f"\n▶▶  Hyper‑run {i}/{len(grid)}  —  {cfg}")
+    try:
+        # ----- build & compile model -----
+        model = build_model(
+            vocab_size, max_len,
+            embed_dim = cfg["embed_dim"],
+            lstm_units = cfg["lstm_units"],
+            lr        = cfg["lr"],
+            train_cnn = False          # keep CNN frozen for speed
+        )
+        print("Built model")
+        
+                # ----- MASK‑PROBE: inspect masks before training -----
+        from tensorflow.keras import Model
+
+        # 1) get inputs
+        img_in  = model.get_layer("image").input
+        seq_in  = model.get_layer("caption_in").input
+
+        # 2) get the three key intermediate outputs
+        tok_emb_out  = model.get_layer("tok_emb").output
+        add_img_out  = model.get_layer("add_img").output
+        slice_out    = model.get_layer("slice_img").output
+        post_mask_out = model.get_layer("re_mask").output
+
+        # 3) build a small probe model
+        probe = Model([img_in, seq_in],
+                      [tok_emb_out, add_img_out, slice_out, post_mask_out])
+
+        # 4) grab a single batch correctly:
+        (img_batch, seq_batch), _ = next(iter(train_ds))
+        #    img_batch.shape → (batch,160,160,3)
+        #    seq_batch.shape → (batch, max_len-1)
+
+        # 5) compute and print the masks
+        masks = probe.compute_mask([img_batch, seq_batch],mask=[None, None])
+        print("Mask after Embedding:     ", masks[0].numpy())
+        print("Mask after AddImageToken:  ", masks[1].numpy())
+        print("Mask after Slicing:        ", masks[2])  # should be None if lost
+        print("After post_mask:",       masks[3].numpy()) # now a boolean array
+        # ----- end MASK‑PROBE -----
+
+
+        # ----- callbacks -----
+        callbacks = [
+            SpiceCallback(val_ds, every=MAX_EPOCHS),
+            keras.callbacks.EarlyStopping(
+                monitor="val_loss",
+                patience=2,
+                mode="min",
+                restore_best_weights=True
+            )
+        ]
+        
+        print("Start training")
+
+        # ----- training -----
+        hist = model.fit(
+            train_ds,
+            validation_data = val_ds,
+            epochs          = MAX_EPOCHS, #starting with few epochs for computational complexity 
+            callbacks       = callbacks,
+            verbose         = 1
+        )
+        
+        print("Done training")
+
+        # ----- record results -----
+        cfg["best_spice"] = max(hist.history.get("val_spice", [0]))
+        cfg["hist"]       = hist.history
+        histories.append(cfg)
+
+    except Exception as e:
+        print(f"❌ run failed: {e}")     # keeps the grid search moving
+        continue
+
+if not histories:                                 # all runs failed
+    raise RuntimeError("All grid runs failed – check earlier errors.")
+
+# grab one example from your batch
+(seq, mask_row) = seq_batch[0], masks[3][0].numpy()
+
+print("Sequence:", seq.numpy())
+print("Mask:    ", mask_row)
+
+#You should see zeros in Sequence exactly where Mask is False.
+
+```
+
+We batch variable‐length captions by zero‑padding shorter sequences—but since those zeros aren’t real tokens, we don’t want the model to predict or be penalized on them. By using `mask_zero=True` in the Embedding, merging and cropping that mask through our custom `AddImageToken` and `Cropping1D` layers, then re‑attaching the original `(seq_in != 0)` mask with a lightweight `ReMask` layer before softmax, we ensure `sparse_categorical_crossentropy` only sums over valid timesteps. This prevents padding tokens from corrupting the loss and focuses training on real caption data.
+
+
+```{python, debugg}
+
+def decode_batch(logits, id2word, end_token_id=None, pad_token_id=0):
+    """
+    logits:   np.array or tf.Tensor of shape (batch, T, vocab_size)
+    id2word:  dict mapping token_id → word string
+    end_token_id:  integer ID of your <end> token (if you have one)
+    pad_token_id:  integer ID of your padding token (often 0)
+    """
+    # 1) pick the most likely token at each timestep
+    token_ids = np.argmax(logits, axis=-1)  # shape (batch, T)
+    
+    captions = []
+    for seq in token_ids:
+        words = []
+        for idx in seq:
+            if end_token_id is not None and idx == end_token_id:
+                break
+            if idx == pad_token_id:
+                break
+            words.append(id2word.get(idx, "<unk>"))
+        captions.append(" ".join(words))
+    return captions
+
+```
+
+
+```{python, gridsearch}
+# -------------------------------------------------------------------
+#  Grid search loop  (4 configs)  with robust try/except protection
+# -------------------------------------------------------------------
+#from tensorflow import keras
+import sys
+
+#grid search w/ 8 configs
+grid = [
+    dict(embed_dim=e, lstm_units=l, lr=a)
+    for e in (128,256) for l in (256,512) for a in (1e-3,1e-4)
+]
+
+grid = [
+    dict(embed_dim=256, lstm_units=512, lr=1e-3)
+   
+]
+
+grid = [
+    dict(embed_dim=128, lstm_units=256, lr=1e-3),
+    dict(embed_dim=256, lstm_units=256, lr=1e-3),
+    dict(embed_dim=256, lstm_units=512, lr=1e-4),
+    dict(embed_dim=128, lstm_units=512, lr=1e-4)
+]
+
+histories = []
+MAX_EPOCHS = 5
+
+for i, cfg in enumerate(grid, 1):
+    print(f"\n▶▶  Hyper‑run {i}/{len(grid)}  —  {cfg}")
+    try:
+        # ----- build & compile model -----
+        model = build_model(
+            vocab_size, max_len,
+            embed_dim = cfg["embed_dim"],
+            lstm_units = cfg["lstm_units"],
+            lr        = cfg["lr"],
+            train_cnn = False          # keep CNN frozen for speed
+        )
+        print("Built model")
+
+        # ----- callbacks ----- turn off spice call back for speed; call final spice at the end
+        callbacks = [
+          
+            keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss",   # same metric as EarlyStopping
+                factor=0.5,           # cut LR in half
+                patience=1,           # after 1 epoch with no val‑loss improvement
+                min_lr=1e-6,          # don’t let it go to zero
+                verbose=1
+            ),
+            #SpiceCallback(val_ds, every=1), 
+            keras.callbacks.EarlyStopping(
+                monitor="val_loss",
+                patience=2,
+                mode="min",
+                restore_best_weights=True
+            )
+        ]
+        
+        print("Start training")
+
+        # ----- training -----
+        hist = model.fit(
+            train_ds,
+            validation_data = val_ds,
+            epochs          = MAX_EPOCHS, #starting with few epochs for computational complexity 
+            callbacks       = callbacks,
+            verbose         = 1
+        )
+        
+        # ----- DEBUGGING SPICE ZERO ----- 
+        # grab one batch from your validation set
+        (img_batch, seq_batch), _ = next(iter(val_ds))
+        # run a forward pass
+        logits = model.predict([img_batch, seq_batch])
+        token_ids = np.argmax(logits, axis=-1)
+        print("Unique predicted IDs:", np.unique(token_ids))
+        print("ID counts:", dict(zip(*np.unique(token_ids, return_counts=True))))
+        print("First sequence token IDs:", token_ids[0])
+        
+        # ensure it’s a numpy array
+        if isinstance(token_ids, tf.Tensor):
+          token_ids = token_ids.numpy()
+
+        mapped = []
+        for idx in token_ids[0]:
+          i = int(idx)
+          if i == PAD_ID or i == END_ID:
+              break
+        mapped.append(id2word.get(i, "<unk>"))
+        print("Mapped words:", mapped)
+        
+        # decode logits → token IDs → words (you’ll already have a function for this)
+        decoded = decode_batch(logits, id2word, end_token_id=END_TOKEN_ID, pad_token_id=PAD_TOKEN_ID)  
+        print("🔍 Sample decoded captions (first 5):")
+        for cap in decoded[:5]:
+          print(" •", cap)
+
+        print("Done training and debug output")
+        # ----- end DEBUGGING -----
+        
+        print("Done training")
+
+        # ----- record results -----
+        cfg["best_spice"] = max(hist.history.get("val_spice", [0]))
+        
+        spice_score = compute_spice(model, val_ds, tok)
+        cfg["final_spice"] = spice_score
+        cfg["val_loss"] = min(hist.history["val_loss"])
+        cfg["hist"] = hist.history
+        histories.append(cfg)
+        print(f"\n✅ Final SPICE score: {spice_score:.4f}")
+
+
+    except Exception as e:
+        print(f"❌ run failed: {e}")     # keeps the grid search moving
+        continue
+
+# -------------------------------------------------------------------
+#  Pick the best configuration
+# -------------------------------------------------------------------
+if not histories:                                 # all runs failed
+    raise RuntimeError("All grid runs failed – check earlier errors.")
+
+# best_cfg = max(histories, key=lambda d: d["best_spice"])
+# print("\n🏆  Best config:", best_cfg)
+#best_cfg = max(histories, key=lambda d: d["final_spice"])
+best_cfg = min(histories, key=lambda d: d["val_loss"])
+print("\n🏆  Best config:", best_cfg)
+
+# (Optional) save results
+json.dump(histories,
+          open(os.path.join(r.output_dir, "grid_results.json"), "w"),
+          indent=2)
+
+```
+
+Select the top 2–3 configs, not just the single best one
+
+1st embed_dim: 256 | lstm_units: 512 | lr: 0.001 - val_loss: 3.6345
+2nd embed_dim: 128 | lstm_units: 512 | lr: 0.001 - val_loss: 3.7287
+3rd embed_dim: 256 | lstm_units: 256 | lr: 0.001 - val_loss: 3.8715
+During the full‑data run:
+
+Save both best‑epoch and final checkpoints (ModelCheckpoint(save_best_only=True, monitor="val_spice") plus EarlyStopping).
+
+Compare their final validation SPICE—sometimes the best‑epoch model edges out by 0.2–0.5 points.
+
+Pick the checkpoint with the higher validation SPICE on the full dataset, then compute test‑set metrics.
+
+```{python, winner}
+
+full_configs = [
+    dict(embed_dim=256, lstm_units=512, lr=1e-3),
+    dict(embed_dim=128, lstm_units=512, lr=1e-3),
+    dict(embed_dim=256, lstm_units=256, lr=1e-3),
+]
+
+# ------------------------------------------------------------------
+# Ensure the checkpoint directory exists
+# ------------------------------------------------------------------
+Path("ckpts").mkdir(parents=True, exist_ok=True)   # does nothing if already there
+
+results = []
+for j, cfg in enumerate(full_configs, 1):
+
+    tag = f"full{j}_ed{cfg['embed_dim']}_lu{cfg['lstm_units']}"
+    model = build_model(vocab_size, max_len, **cfg, train_cnn=False)
+    
+    spice_cb  = SpiceCallback(val_ds, every=1)
+
+    best_ckpt  = keras.callbacks.ModelCheckpoint(
+        f"ckpts/{tag}_best.weights.h5",
+        monitor="val_spice",
+        mode="max",
+        save_best_only=True,
+        save_weights_only=True,
+        verbose=1
+    )
+    early_stop = keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=3,
+        restore_best_weights=True
+    )
+    reduce_lr  = keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.5,
+        patience=1,
+        min_lr=1e-6,
+        verbose=1
+    )
+
+    hist = model.fit(
+        train_ds,
+        validation_data = val_ds,
+        epochs          = 30,          # plenty; ES will stop sooner
+        callbacks       = [spice_cb, best_ckpt, early_stop, reduce_lr],
+        verbose         = 1
+    )
+    
+    # ----- ② save EarlyStopping‑restored “final” weights -----------
+    final_path = f"ckpts/{tag}_final.weights.h5"
+    model.save_weights(final_path)
+    print(f"Saved final weights → {final_path}")
+
+    # -----------------------------------------------------------------
+    # Evaluate both checkpoints on the validation set
+    # -----------------------------------------------------------------
+    model.load_weights(f"ckpts/{tag}_best.weights.h5")
+    spice_best = compute_spice(model, val_ds, tok)
+
+    model.load_weights(final_path)  # ES-restored
+    spice_final = compute_spice(model, val_ds, tok)
+
+    results.append(dict(cfg=cfg,
+                        spice_best = spice_best,
+                        spice_final= spice_final,
+                        val_loss   = min(hist.history['val_loss']),
+                        history = hist.history
+                        ))
+                        
+                        
+winner = max(results, key=lambda d: max(d['spice_best'], d['spice_final']))
+print("🏆  Winning config:", winner['cfg'])
+print(f"   SPICE  best‑epoch : {winner['spice_best']:.6f}")
+print(f"   SPICE  final‑epoch: {winner['spice_final']:.6f}")
+
+#fhistory = winner["history"]
+
+json.dump(results,
+          open(os.path.join(r.output_dir, "grid_results2.json"), "w"),
+          indent=2)
+          
+Winning config: {'embed_dim': 128, 'lstm_units': 512, 'lr': 0.001}
+```
+Winning config: {'embed_dim': 128, 'lstm_units': 512, 'lr': 0.001} for SPICE
+```{python}
+
+# --- rebuild exactly the same architecture ---
+fbest_cfg = winner["cfg"]          # already printed above
+modelb = build_model(vocab_size, max_len, **fbest_cfg, train_cnn=False)
+
+# choose which checkpoint you want to showcase
+ckpt_path = f"ckpts/full2_ed128_lu512_best.weights.h5"
+# if you’d rather show the Early-Stopping “final” weights, swap the filename here
+modelb.load_weights(ckpt_path)
+print("✓  Weights loaded:", ckpt_path)
+
+
+def preprocess_image(path, target_size=160):
+    """Read & preprocess 1 image exactly as in training."""
+    img_raw = tf.io.read_file(path)
+    img     = tf.image.decode_jpeg(img_raw, channels=3)
+    img     = tf.image.resize(img, (target_size, target_size)) / 255.0
+    return img
+
+import tensorflow as tf
+from typing import List, Tuple
+
+def beam_search_decode(model, img_tensor, tokenizer, max_len, k=3, alpha=0.7):
+    beam = [([tokenizer.start_id], 0.0)]           # (tokens, log-prob)
+    img_batch = img_tensor[None, ...]              # (1, H, W, 3)
+
+    for _ in range(max_len - 1):
+        new_beam = []
+
+        for seq, log_p in beam:
+            if seq[-1] == tokenizer.end_id:        # branch already finished
+                new_beam.append((seq, log_p))
+                continue
+
+            # ---------- pad to fixed length ----------
+            pad_len  = (max_len - 1) - len(seq)
+            seq_pad  = seq + [tokenizer.pad_id] * pad_len
+            seq_in   = tf.constant([seq_pad], dtype=tf.int32)   # (1, L)
+            preds    = model([img_batch, seq_in])               # (1, L, V)
+
+            # take logits at position len(seq)-1 (current last real token)
+            idx_last = len(seq) - 1
+            logits   = preds[0, idx_last]
+            log_probs = tf.math.log_softmax(logits)
+
+            # ---------- expand top-k ----------
+            topk = tf.math.top_k(log_probs, k=k)
+            for idx, lp_step in zip(topk.indices.numpy(), topk.values.numpy()):
+                new_seq   = seq + [int(idx)]
+                new_log_p = log_p + float(lp_step)
+                new_beam.append((new_seq, new_log_p))
+
+        new_beam.sort(key=lambda t: t[1], reverse=True)
+        beam = new_beam[:k]
+
+        if all(s[-1] == tokenizer.end_id for s, _ in beam):
+            break
+
+    # ---------- length-normalised best ----------
+    best_seq = max(beam, key=lambda t: t[1] / (len(t[0]) ** alpha))[0]
+
+    # strip special tokens
+    if best_seq[0] == tokenizer.start_id: best_seq = best_seq[1:]
+    if best_seq and best_seq[-1] == tokenizer.end_id: best_seq = best_seq[:-1]
+
+    return tokenizer.decode(best_seq)
+
+
+
+def show_caption(path, caption):
+    img_disp = Image.open(path)
+    plt.imshow(img_disp); plt.axis('off')
+    plt.title(caption, fontsize=12, wrap=True)
+    plt.show()
+    
+    
+# ——— tokenizer patch (only needed once) ———
+tok.start_id = tok.word2idx["<start>"]
+tok.end_id   = tok.word2idx["<end>"]
+tok.pad_id   = 0
+
+# grab a handful of validation-set file paths
+val_files = val_subset["image"].sample(5, random_state=42)
+# (or use test images you’ve never seen)
+
+for fname in val_files:
+    path = os.path.join(r.img_dir, fname)
+    img_tensor = preprocess_image(path)
+    caption    = beam_search_decode(modelb, img_tensor, tok, max_len, k=3)
+    show_caption(path, caption)
+
+```
+
+```{python, finalhyper}
+
+final_config = [dict(embed_dim=128, lstm_units=512, lr=1e-3)]
+# ------------------------------------------------------------------
+# Ensure the checkpoint directory exists
+# ------------------------------------------------------------------
+Path("ckpts_f").mkdir(parents=True, exist_ok=True)   # does nothing if already there
+
+fresults = []
+
+for j, cfg in enumerate(final_config, 1):
+
+    tag = f"full{j}_ed{cfg['embed_dim']}_lu{cfg['lstm_units']}"
+    model = build_model(vocab_size, max_len, **cfg, train_cnn=False)
+    
+    spice_cb  = SpiceCallback(val_ds, every=1)
+    #spice_cb = SpiceCallback(ds=val_ds, tokenizer=tok, max_len=20, output_dir=r.output_dir, every=1, k=3, eval_subset=50)  #k=beam width
+
+    best_ckpt  = keras.callbacks.ModelCheckpoint(
+        f"ckpts_f/{tag}_best.weights.h5",
+        monitor="val_spice",
+        mode="max",
+        save_best_only=True,
+        save_weights_only=True,
+        verbose=1
+    )
+    early_stop = keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=20,
+        restore_best_weights=True
+    )
+    reduce_lr  = keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.5,
+        patience=5,
+        min_lr=1e-6,
+        verbose=1
+    )
+
+    hist = model.fit(
+        train_ds,
+        validation_data = val_ds,
+        epochs          = 50,          # plenty; ES will stop sooner
+        callbacks       = [spice_cb, best_ckpt, early_stop, reduce_lr],
+        verbose         = 1
+    )
+    
+    # ----- ② save EarlyStopping‑restored “final” weights -----------
+    final_path = f"ckpts_f/{tag}_final.weights.h5"
+    model.save_weights(final_path)
+    print(f"Saved final weights → {final_path}")
+
+    # -----------------------------------------------------------------
+    # Evaluate both checkpoints on the validation set
+    # -----------------------------------------------------------------
+    model.load_weights(f"ckpts_f/{tag}_best.weights.h5")
+    spice_best = compute_spice(model, val_ds, tok)
+    #spice_best = compute_spice(model, val_ds, tok, max_len=20, beam_width=3, eval_subset=50)
+
+    model.load_weights(final_path)  # ES-restored
+    spice_final = compute_spice(model, val_ds, tok)
+    #spice_final = compute_spice(model, val_ds, tok, max_len=20, beam_width=3, eval_subset=50)
+
+    fresults.append(dict(cfg=cfg,
+                        spice_best = spice_best,
+                        spice_final= spice_final,
+                        val_loss   = min(hist.history['val_loss']),
+                        history = hist.history
+                        ))
+                        
+
+```
+
+```{python, finetune}
+final_config = [dict(embed_dim=128, lstm_units=512, lr=1e-3)]
+
+Path("ckpts_f3").mkdir(parents=True, exist_ok=True)
+
+f3results = []
+
+for j, cfg in enumerate(final_config, 1):
+
+    tag = f"full{j}_ed{cfg['embed_dim']}_lu{cfg['lstm_units']}"
+    model = build_model(vocab_size, max_len, **cfg, train_cnn=False)
+    
+    val_subs = val_ds.take(10)
+    spice_cb  = SpiceCallback(
+      ds        = val_subs,
+      tok       = tok,
+      max_len   = max_len,
+      every     = 1,      # compute each epoch
+      k         = 1,      # set >1 to switch to beam
+      out_dir   = "ckpts_f3"
+    )
+
+    best_ckpt  = keras.callbacks.ModelCheckpoint(
+        f"ckpts_f3/{tag}_best.weights.h5",
+        monitor="val_spice",
+        mode="max",
+        save_best_only=True,
+        save_weights_only=True,
+        verbose=1
+    )
+    early_stop = keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=15,
+        restore_best_weights=True
+    )
+    reduce_lr  = keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.5,
+        patience=4,
+        min_lr=1e-6,
+        verbose=1
+    )
+
+    hist = model.fit(
+        train_ds,
+        validation_data = val_ds,
+        epochs          = 50,          
+        callbacks       = [spice_cb, best_ckpt, early_stop, reduce_lr],
+        verbose         = 1
+    )
+    
+    # ----- ② save EarlyStopping‑restored “final” weights -----------
+    final_path = f"ckpts_f3/{tag}_final.weights.h5"
+    model.save_weights(final_path)
+    print(f"Saved final weights → {final_path}")
+
+  
+    model.load_weights(f"ckpts_f3/{tag}_best.weights.h5")
+    spice_best = compute_spice(model, val_ds, tok, max_len=max_len, k=1)
+
+    model.load_weights(final_path)  # ES-restored
+    spice_final = compute_spice(model, val_ds, tok, max_len=max_len, k=1)
+
+    f3results.append(dict(cfg=cfg,
+                        spice_best = spice_best,
+                        spice_final= spice_final,
+                        val_loss   = min(hist.history['val_loss']),
+                        history = hist.history
+                        ))
+```
+
+```{python, viewimagecaps}
+# --- rebuild exactly the same architecture ---
+fbest_cfg = winner["cfg"] # already printed above
+fbest_cfg = dict(embed_dim=128, lstm_units=512, lr=1e-3)
+modelf = build_model(vocab_size, max_len, **fbest_cfg, train_cnn=False)
+
+# choose which checkpoint you want to showcase
+ckpt_path = f"ckpts_f3/full1_ed128_lu512_best.weights.h5"
+path2 = f"ckpts_f4/best_captioner.h5"
+ckpt_path2 = f"ckpts_f2/full1_ed128_lu512_final.weights.h5"
+# if you’d rather show the Early-Stopping “final” weights, swap the filename here
+modelf.load_weights(ckpt_path2)
+print("✓  Weights loaded:", ckpt_path2)
+
+modelf.load_weights(path2)
+print("✓  Weights loaded:", path2)
+
+
+# quick smoke test – run once after training
+refstest = {
+    0: ["two young boys sitting in a car",      # reference caption 1
+        "two children inside a vehicle"]        # reference caption 2
+}
+refstest = {
+    0: ["two children inside a vehicle"]       
+}
+hypstest = {
+    0: ["two children inside a vehicle"]                  # model-generated caption
+}
+
+# 2. Instantiate the scorer
+scorer = Spice()                 # you can add cache_root=... if you like
+
+# 3. Compute SPICE
+corpus_spice, per_image_scores = scorer.compute_score(refstest, hypstest)
+
+print("Corpus-level SPICE:", corpus_spice)
+# per_image_scores is a list with one entry per image id
+
+
+
+def preprocess_image(path, target_size=224):
+    """Read & preprocess 1 image exactly as in training."""
+    img_raw = tf.io.read_file(path)
+    img     = tf.image.decode_jpeg(img_raw, channels=3)
+    img     = tf.image.resize(img, (target_size, target_size)) / 255.0
+    return img
+
+import tensorflow as tf
+from typing import List, Tuple
+
+def beam_search_decode(model, img_tensor, tokenizer, max_len, k=3, alpha=0.7):
+    beam = [([tokenizer.start_id], 0.0)]           # (tokens, log-prob)
+    img_batch = img_tensor[None, ...]              # (1, H, W, 3)
+
+    for _ in range(max_len - 1):
+        new_beam = []
+
+        for seq, log_p in beam:
+            if seq[-1] == tokenizer.end_id:        # branch already finished
+                new_beam.append((seq, log_p))
+                continue
+
+            # ---------- pad to fixed length ----------
+            pad_len  = (max_len - 1) - len(seq)
+            seq_pad  = seq + [tokenizer.pad_id] * pad_len
+            seq_in   = tf.constant([seq_pad], dtype=tf.int32)   # (1, L)
+            preds    = model([img_batch, seq_in])               # (1, L, V)
+
+            # take logits at position len(seq)-1 (current last real token)
+            idx_last = len(seq) - 1
+            logits   = preds[0, idx_last]
+            log_probs = tf.math.log_softmax(logits)
+
+            # ---------- expand top-k ----------
+            topk = tf.math.top_k(log_probs, k=k)
+            for idx, lp_step in zip(topk.indices.numpy(), topk.values.numpy()):
+                new_seq   = seq + [int(idx)]
+                new_log_p = log_p + float(lp_step)
+                new_beam.append((new_seq, new_log_p))
+
+        new_beam.sort(key=lambda t: t[1], reverse=True)
+        beam = new_beam[:k]
+
+        if all(s[-1] == tokenizer.end_id for s, _ in beam):
+            break
+
+    # ---------- length-normalised best ----------
+    best_seq = max(beam, key=lambda t: t[1] / (len(t[0]) ** alpha))[0]
+
+    # strip special tokens
+    if best_seq[0] == tokenizer.start_id: best_seq = best_seq[1:]
+    if best_seq and best_seq[-1] == tokenizer.end_id: best_seq = best_seq[:-1]
+
+    return tokenizer.decode(best_seq)
+
+
+
+def show_caption(path, caption):
+    img_disp = Image.open(path)
+    plt.imshow(img_disp); plt.axis('off')
+    plt.title(caption, fontsize=12, wrap=True)
+    plt.show()
+    
+    
+# ——— tokenizer patch (only needed once) ———
+tok.start_id = tok.word2idx["<start>"]
+tok.end_id   = tok.word2idx["<end>"]
+tok.pad_id   = 0
+
+# grab a handful of validation-set file paths
+val_files = val_subset["image"].sample(10, random_state=42)
+# (or use test images you’ve never seen)
+
+for fname in val_files:
+    path = os.path.join(r.img_dir, fname)
+    img_tensor = preprocess_image(path)
+    caption    = beam_search_decode(modelf, img_tensor, tok, max_len, k=3)
+    show_caption(path, caption)
+
+
+```
+
+```{python, SPICEmodeltest}
+
+val_spiceset = val_ds.take(10)
+modelf = build_model(vocab_size, max_len, **fbest_cfg, train_cnn=False)
+#p1 = f"ckpts_f/full1_ed128_lu512_best.weights.h5"
+p2 = f"ckpts_f2/full1_ed128_lu512_best.weights.h5"
+modelf.load_weights(p2)
+print("✓  Weights loaded:", p2)
+cp2 = compute_spice(modelf, val_spiceset, tok, max_len=max_len, k=1)
+#0.08703
+
+modelf = build_model(vocab_size, max_len, **fbest_cfg, train_cnn=False)
+p3 = f"ckpts_f3/full1_ed128_lu512_best.weights.h5"
+modelf.load_weights(p3)
+print("✓  Weights loaded:", p3)
+cp3 = compute_spice(modelf, val_spiceset, tok, max_len=max_len, k=1)
+#0.09643
+
+modelf = build_model(vocab_size, max_len, **fbest_cfg, train_cnn=False)
+p4 = f"ckpts_f4/best_captioner.h5"
+modelf.load_weights(p4)
+print("✓  Weights loaded:", p4)
+cp4 = compute_spice(modelf, val_spiceset, tok, max_len=max_len, k=1)
+#0.09786
+
+
+```
+
+```{python, retrain}
+Path("ckpts_f6").mkdir(parents=True, exist_ok=True)
+
+resultsft = []
+
+modelft = build_model(vocab_size, max_len,
+                    embed_dim = 128,        # <- same as best run
+                    lstm_units = 512,
+                    lr = 1e-3,              # overwritten after loading
+                    train_cnn = False)
+
+#ckpt_path = f"ckpts_f3/full1_ed128_lu512_best.weights.h5"
+pathretune = f"ckpts_f4/best_captioner.h5"
+modelft.load_weights(pathretune)
+print("✓  Loaded weights from", pathretune)
+
+#   S = 49 for a 7×7 grid  (or 36 for BUTD regions)
+attn_tensor = modelft.get_layer("attn").output[1]   # index 1 = weights
+vis_model   = keras.Model(
+      inputs  = modelft.inputs,
+      outputs = attn_tensor                        # shape (B, T, S)
+)
+print("✓  Visualiser model ready")
+
+finetune_lr = 1e-5          # start tiny; RLROP will lower further if needed
+modelft.compile(optimizer = keras.optimizers.Adam(finetune_lr),
+              loss      = "sparse_categorical_crossentropy")
+
+UNFREEZE_AT = -20           # last 20 layers
+def unfreeze_cnn(epoch, logs):
+    if epoch == 3:
+        for layer in modelft.get_layer("mobilenetv2_1.00_224").layers[UNFREEZE_AT:]:
+            layer.trainable = True
+        print(f"\n🔓  Unfroze last {abs(UNFREEZE_AT)} CNN layers;"
+              f" continuing with LR = {keras.backend.get_value(modelft.optimizer.lr):.2e}")
+
+unfreeze_cb = keras.callbacks.LambdaCallback(on_epoch_begin=unfreeze_cnn)
+
+ckpt_fine = keras.callbacks.ModelCheckpoint(
+    f"ckpts_f6/finetune_best_spice.h5",
+    monitor = "val_spice",
+    mode    = "max",
+    save_best_only = True,
+    save_weights_only = True,
+    verbose = 1)
+
+rlrop = keras.callbacks.ReduceLROnPlateau(
+    monitor  = "val_loss",
+    factor   = 0.5,
+    patience = 3,
+    min_lr   = 1e-7,
+    verbose  = 1)
+
+val_subs = val_ds.take(15)
+spice_cb = SpiceCallback(ds       = val_subs, 
+                         tok      = tok,
+                         max_len  = max_len,
+                         every    = 1,
+                         k        = 1,
+                         out_dir  = "ckpts_f6")
+
+EPOCHS = 10
+histft = modelft.fit(
+    train_ds,
+    epochs          = EPOCHS,
+    validation_data = val_ds,
+    callbacks       = [ckpt_fine, rlrop, spice_cb, unfreeze_cb],
+    verbose         = 1
+)
+
+final_path = f"ckpts_f6/retrain_final.weights.h5"
+modelft.save_weights(final_path)
+print(f"Saved final weights → {final_path}")
+
+resultsft.append(dict(
+                    val_loss   = min(histft.history['val_loss']),
+                    history = histft.history
+                    ))
+                    
+metrics_history = {
+    "loss": [float(x) for x in histft.history["loss"]],
+    "val_loss": [float(x) for x in histft.history["val_loss"]],
+    "val_spice": [float(x) for x in histft.history["val_spice"]]
+}
+
+with open(os.path.join(r.output_dir, "training_metrics.json"), "w") as f:
+    json.dump(metrics_history, f, indent=2)
+
+```
+
+```{python, diag plots}
+#Ex of first run loss vs val loss
+with open("grid_results.json") as h:
+    gridrun = json.load(h)
+
+run = gridrun[0]  
+exhist = run["hist"]
+plt.clf()
+plt.plot(exhist["loss"], label="Training Loss")
+plt.plot(exhist["val_loss"], label="Validation Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Loss Curves for Preliminary Training")
+plt.legend()
+plt.show()
+
+#After first re-train
+# Load the metrics
+with open("training_metrics.json") as f:
+    metrics = json.load(f)
+
+# Plot loss
+plt.figure()
+plt.plot(metrics["loss"], label="Training Loss")
+plt.plot(metrics["val_loss"], label="Validation Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Loss Over Epochs - Re-training")
+plt.legend()
+plt.show()
+
+# Plot SPICE
+plt.figure()
+plt.plot(metrics["val_spice"], label="Validation SPICE", color="green")
+plt.xlabel("Epoch")
+plt.ylabel("SPICE Score")
+plt.title("Validation SPICE Over Epochs - Re-training")
+plt.legend()
+plt.show()
+
+#After second re-train
+# Load the metrics
+with open("training_metrics2.json") as f:
+    metrics2 = json.load(f)
+
+# Plot loss
+plt.figure()
+plt.plot(metrics2["loss"], label="Training Loss")
+plt.plot(metrics2["val_loss"], label="Validation Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Loss Over Epochs - Re-training V2")
+plt.legend()
+plt.show()
+
+# Plot SPICE
+plt.figure()
+plt.plot(metrics2["val_spice"], label="Validation SPICE", color="green")
+plt.xlabel("Epoch")
+plt.ylabel("SPICE Score")
+plt.title("Validation SPICE Over Epochs - Re-training V2")
+plt.legend()
+plt.show()
+
+
+
+```
+
+```{python, viewcap}
+fbest_cfg = dict(embed_dim=128, lstm_units=512, lr=1e-3)
+modelre = build_model(vocab_size, max_len, **fbest_cfg, train_cnn=True)
+
+retrain_path = f"ckpts_f6/best_captioner.h5"
+
+modelre.load_weights(retrain_path)
+print("✓  Weights loaded:", retrain_path)
+
+# for fname in val_files:
+#     path = os.path.join(r.img_dir, fname)
+#     img_tensor = preprocess_image(path)
+#     caption    = beam_search_decode(modelre, img_tensor, tok, max_len, k=3)
+#     show_caption(path, caption)
+
+def show_caption2(path, pred_caption, true_captions=None, max_gt=2):
+    """Display an image with its predicted and reference captions."""
+    #from IPython.display import display
+    img_disp = Image.open(path)
+    plt.imshow(img_disp)
+    plt.axis('off')
+
+    title = f"Predicted: {pred_caption}"
+    if true_captions:
+        shown = true_captions[:max_gt]  # only show a few to keep it readable
+        gt_text = "\n".join([f"GT {i+1}: {cap}" for i, cap in enumerate(shown)])
+        title += f"\n{gt_text}"
+
+    plt.title(title, fontsize=10, wrap=True)
+    plt.show()
+
+val_sample = val_subset.sample(10, random_state=42)
+
+for _, row in val_sample.iterrows():
+    fname = row["image"]
+    gt_captions = row["caption"]  # assumed to be a list of strings
+    if isinstance(gt_captions, str):
+        gt_captions = gt_captions.split("|")  # adjust delimiter as needed
+    path = os.path.join(r.img_dir, fname)
+
+    img_tensor = preprocess_image(path)
+    pred_caption = beam_search_decode(modelre, img_tensor, tok, max_len, k=3)
+
+    show_caption2(path, pred_caption, gt_captions)
+  
+    
+
+
+```
+
+```{python, re-trainv2}
+Path("ckpts_f7").mkdir(parents=True, exist_ok=True)
+
+v2retrain = []
+
+modelft2 = build_model(vocab_size, max_len,
+                    embed_dim = 128,      
+                    lstm_units = 512,
+                    lr = 1e-3,             
+                    train_cnn = True)
+
+
+
+pathretune2 = f"ckpts_f6/best_captioner.h5"
+modelft2.load_weights(pathretune2)
+print("✓  Loaded weights from", pathretune2)
+
+cnn = modelft2.get_layer("mobilenetv2_1.00_224")
+for layer in cnn.layers:
+    layer.trainable = False
+print("✓  Re-froze CNN layers for warm-up")
+
+#   S = 49 for a 7×7 grid  (or 36 for BUTD regions)
+attn_tensor2 = modelft2.get_layer("attn").output[1]   # index 1 = weights
+vis_model2   = keras.Model(
+      inputs  = modelft2.inputs,
+      outputs = attn_tensor2                        # shape (B, T, S)
+)
+print("✓  Visualiser model ready")
+
+# ---------------------------------------------------------------
+# 2.  Re-compile with a much smaller LR
+# ---------------------------------------------------------------
+finetune_lr = 1e-5         # start tiny; RLROP will lower further if needed
+modelft2.compile(optimizer = keras.optimizers.Adam(finetune_lr),
+              loss      = "sparse_categorical_crossentropy")
+
+
+# UNFREEZE_AT = -10  # last 10 layers
+# def unfreeze_cnn(epoch, logs):
+#     if epoch == 2:
+#         for layer in cnn.layers[UNFREEZE_AT:]:
+#             layer.trainable = True
+#         print(f"\n🔓  Unfroze last {abs(UNFREEZE_AT)} CNN layers; recompiling...")
+# 
+#         # Recompile with small LR after unfreezing
+#         modelft2.compile(optimizer=keras.optimizers.Adam(1e-5),
+#                          loss="sparse_categorical_crossentropy")
+# 
+# unfreeze_cb = keras.callbacks.LambdaCallback(on_epoch_begin=unfreeze_cnn)
+
+# ---------------------------------------------------------------
+# 4.  Callbacks: ModelCheckpoint + ReduceLROnPlateau + SPICE
+# ---------------------------------------------------------------
+ckpt_fine = keras.callbacks.ModelCheckpoint(
+    f"ckpts_f7/finetune_best_spice.h5",
+    monitor = "val_spice",
+    mode    = "max",
+    save_best_only = True,
+    save_weights_only = True,
+    verbose = 1)
+
+rlrop = keras.callbacks.ReduceLROnPlateau(
+    monitor  = "val_loss",
+    factor   = 0.5,
+    patience = 2,
+    min_lr   = 1e-7,
+    verbose  = 1)
+
+val_subs = val_ds.take(15)
+spice_cb = SpiceCallback(ds       = val_subs, 
+                         tok      = tok,
+                         max_len  = max_len,
+                         every    = 1,
+                         k        = 1,
+                         out_dir  = "ckpts_f7")
+
+modelft2.fit(train_ds,
+             epochs=2,
+             validation_data=val_ds,
+             callbacks=[ckpt_fine, rlrop, spice_cb],
+             verbose=1)
+
+
+for layer in cnn.layers[-10:]:
+    layer.trainable = True
+print("🔓  unfroze last 10 CNN layers")
+
+
+modelft2.compile(optimizer=keras.optimizers.Adam(5e-5),
+                 loss="sparse_categorical_crossentropy")
+
+
+histft2 = modelft2.fit(train_ds,
+             initial_epoch=2,   # resumes epoch count
+             epochs=10,
+             validation_data=val_ds,
+             callbacks=[ckpt_fine, rlrop, spice_cb],
+             verbose=1)
+
+
+
+
+
+# EPOCHS = 10
+# histft2 = modelft2.fit(
+#     train_ds,
+#     epochs          = EPOCHS,
+#     validation_data = val_ds,
+#     callbacks       = [ckpt_fine, rlrop, spice_cb, unfreeze_cb],
+#     verbose         = 1
+# )
+
+final_path = f"ckpts_f7/retrain_final.weights.h5"
+modelft2.save_weights(final_path)
+print(f"Saved final weights → {final_path}")
+
+
+v2retrain.append(dict(
+                    val_loss   = min(histft2.history['val_loss']),
+                    history = histft2.history
+                    ))
+                    
+
+metrics_history2 = {
+    "loss": [float(x) for x in histft2.history["loss"]],
+    "val_loss": [float(x) for x in histft2.history["val_loss"]],
+    "val_spice": [float(x) for x in histft2.history["val_spice"]]
+}
+
+
+with open(os.path.join(r.output_dir, "training_metrics2.json"), "w") as f:
+    json.dump(metrics_history2, f, indent=2)
+    
+    
+modelft2.save("ckpts_f7/fullmodel_retrain.h5", save_format="h5")
+```
+
+```{python, vewcapsv2}
+fbest_cfg = dict(embed_dim=128, lstm_units=512, lr=1e-3)
+modelrev2 = build_model(vocab_size, max_len, **fbest_cfg, train_cnn=True)
+
+retrain_pathv2 = f"ckpts_f7/best_captioner.h5"
+
+modelrev2.load_weights(retrain_pathv2)
+print("✓  Weights loaded:", retrain_pathv2)
+
+
+
+import h5py, tensorflow as tf, pprint
+
+vc_path = "ckpts_f7/best_captioner.h5"
+modelvc     = modelrev2           # <-- your rebuilt model object
+
+# ------------------------------------------------------------------
+# 1️⃣  build a dict of { weight_name : (shape,) } for the model
+# ------------------------------------------------------------------
+model_shapes = {w.name.split(':')[0]: tuple(w.shape) for w in modelvc.weights}
+
+# ------------------------------------------------------------------
+# 2️⃣  build the same dict from the .h5 checkpoint
+# ------------------------------------------------------------------
+file_shapes = {}
+with h5py.File(vc_path, "r") as f:
+    def collect(name, obj):
+        if isinstance(obj, h5py.Dataset):
+            file_shapes[name] = obj.shape
+    f.visititems(collect)
+
+# ------------------------------------------------------------------
+# 3️⃣  find keys that exist in both but have different shapes
+# ------------------------------------------------------------------
+mismatch = [(k, model_shapes[k], file_shapes[k])
+            for k in model_shapes.keys() & file_shapes.keys()
+            if model_shapes[k] != file_shapes[k]]
+
+print("🔎  First five mismatches (if any):")
+pprint.pprint(mismatch[:5])
+print(f"\nTotal mismatches: {len(mismatch)}")
+
+
+
+def show_caption2(path, pred_caption, true_captions=None, max_gt=2):
+    """Display an image with its predicted and reference captions."""
+    #from IPython.display import display
+    img_disp = Image.open(path)
+    plt.imshow(img_disp)
+    plt.axis('off')
+
+    title = f"Predicted: {pred_caption}"
+    if true_captions:
+        shown = true_captions[:max_gt]  # only show a few to keep it readable
+        gt_text = "\n".join([f"GT {i+1}: {cap}" for i, cap in enumerate(shown)])
+        title += f"\n{gt_text}"
+
+    plt.title(title, fontsize=10, wrap=True)
+    plt.show()
+
+val_sample = val_subset.sample(10, random_state=42)
+
+val_sample = val_subset.sample(20, random_state=12)
+for _, row in val_sample.iterrows():
+    fname = row["image"]
+    gt_captions = row["caption"]  # assumed to be a list of strings
+    if isinstance(gt_captions, str):
+        gt_captions = gt_captions.split("|")  # adjust delimiter as needed
+    path = os.path.join(r.img_dir, fname)
+
+    img_tensor = preprocess_image(path)
+    pred_caption = beam_search_decode(modelft2, img_tensor, tok, max_len, k=3)
+
+    show_caption2(path, pred_caption, gt_captions)
+
+```
+
+```{r, diagnostics}
+library(ggplot2)
+library(jsonlite)
+library(tibble)
+res <- fromJSON("grid_results.json", simplifyVector=FALSE)
+best <- res[[which.max(sapply(res,"[[","final_spice"))]]
+hist <- best$hist
+df <- tibble(epoch = as.numeric(seq_along(hist$loss)),
+             loss  = as.numeric(hist$loss),
+             val_loss = as.numeric(hist$val_loss))
+             #spice = as.numeric(hist$val_spice))
+# Loss curve
+ggplot(df,aes(epoch,loss))+
+  geom_line()+geom_line(aes(y=val_loss),linetype=2)+
+  labs(title="Training vs validation loss")
+# SPICE curve
+# ggplot(df,aes(epoch,spice))+geom_line()+
+#   labs(title="Validation SPICE across epochs")
+
+
+```
+
+```{python}
+# 1) After training, plot loss curves:
+epochs = range(1, len(hist.history['loss']) + 1)
+
+plt.figure()
+plt.plot(epochs, hist.history['loss'], label='train loss')
+plt.plot(epochs, hist.history['val_loss'], label='val loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training & Validation Loss')
+plt.legend()
+plt.show()
+
+# 2) After your debug forward‐pass, plot the token‑ID histogram:
+#    (you’ve already got token_ids from `np.argmax(logits,axis=-1)`)
+flat_ids = token_ids.flatten()
+unique, counts = np.unique(flat_ids, return_counts=True)
+
+plt.figure()
+plt.bar(unique, counts)
+plt.xlabel('Token ID')
+plt.ylabel('Count')
+plt.title('Predicted Token Distribution')
+plt.show()
+
+
+
+```
+
